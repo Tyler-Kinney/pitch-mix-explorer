@@ -1,0 +1,22 @@
+button.collapse-toggle {
+  display: none !important;
+}
+
+.btn-theme-green {
+  background-color: #52B788;
+  border-color: #40916C;
+  color: white;
+}
+
+.btn-theme-green:hover {
+  background-color: #40916C;
+  border-color: #2D6A4F;
+  color: white;
+}
+
+.btn-theme-green:active,
+.btn-theme-green:focus {
+  background-color: #2D6A4F !important;
+  border-color: #1B4332 !important;
+  color: white !important;
+}

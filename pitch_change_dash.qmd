@@ -1,0 +1,936 @@
+---
+title: "Pitch Mix Explorer"
+author: "Tyler Kinney"
+format:
+  dashboard:
+    theme: minty
+    orientation: rows
+    scrolling: false
+    embed-resources: true
+    css: Styles.css
+    logo: Michael_King.jpg
+    nav-buttons:
+      - icon: github
+        href: https://github.com/Tyler-Kinney/
+        aria-label: GitHub Repository
+      - icon: envelope
+        href: mailto:kinneytyler101@gmail.com
+        aria-label: Email
+      - icon: linkedin
+        href: https://www.linkedin.com/in/tyler-kinney-7208303a2
+        aria-label: LinkedIn Profile
+execute:
+  echo: false
+  error: false
+  warning: false
+  message: false
+editor: source
+server: shiny
+---
+
+```{r}
+#| label: packages-setup
+#| context: setup
+library(tidyverse)
+library(shiny)
+library(shinyWidgets)
+library(plotly)
+library(gt)
+library(scales)
+
+pitch_type_colors <- c(
+  # Primary/common pitches — full green spectrum, most saturated
+  "FF" = "#1B4332",  # four-seam fastball
+  "SI" = "#2D6A4F",  # sinker
+  "FC" = "#40916C",  # cutter
+  "SL" = "#52B788",  # slider
+  "ST" = "#74C69D",  # sweeper
+  "CU" = "#95D5B2",  # curveball
+  "KC" = "#B7E5C7",  # knuckle curve
+  "CH" = "#40916C",  # changeup (reuse cutter's tone — rarely adjacent to it in practice)
+  "FS" = "#2D9A4F",  # splitter (reuse sinker's tone)
+  "SV" = "#95C2B2",  # slurve (reuse curveball's tone)
+
+  # Rare/legacy pitch types — muted, out-of-family so they don't blend into a main color's meaning
+  "KN" = "#8D99AE",  # knuckleball
+  "FA" = "#8D99AE",  # generic fastball (legacy Statcast code)
+  "SC" = "#ADB5BD",  # screwball
+  "FO" = "#ADB5BD",  # forkball
+
+  # Non-pitch events — grey, deliberately outside the color-coded pitch palette
+  "IN" = "#CED4DA",  # intentional ball
+  "PO" = "#CED4DA",  # pitchout
+  "AB" = "#CED4DA",  # automatic ball (legacy)
+  "CS" = "#CED4DA"   # (rare/legacy code)
+)
+```
+
+```{r}
+#| label: load-data
+#| context: setup
+# scrapped form savant and baseball reference
+pitch_changes <- read.csv("pitch_changes.csv") |>
+  mutate(FIP_diff = -FIP_diff)
+
+player_year_data <- read.csv("player_year_data.csv")
+
+max_pitch_change <- pitch_changes |>
+  group_by(pitcher, player_name, team_from, team_to, year_from, year_to) |>
+  slice_max(order_by = abs_change, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  rename(
+    biggest_changed_pitch = pitch_type,
+    biggest_prop_change = prop_change,
+    biggest_abs_change = abs_change
+  )
+```
+
+# Investigating Changing Pitches
+
+## Filters {.sidebar}
+
+```{r}
+sliderInput(
+  "cutoff_pct",
+  "Major Change Cutoff Percentile:",
+  min = 0,
+  max = 100,
+  value = 95,
+  step = 1,
+  post = "%"
+)
+
+selectInput(
+  "switched_teams",
+  "Switched Teams?",
+  choices = c("All", "Yes", "No"),
+  selected = "All"
+)
+
+sliderInput(
+  "year_range",
+  "Starting Season Year:",
+  min = min(pitch_changes$year_from),
+  max = max(pitch_changes$year_from),
+  value = c(
+    min(pitch_changes$year_from),
+    max(pitch_changes$year_from)
+  ),
+  step = 1,
+  sep = ""
+)
+
+selectInput(
+  "new_pitch",
+  "Added a New Pitch?",
+  choices = c("All", "Yes", "No")
+)
+
+sliderTextInput(
+  inputId = "age_range",
+  label = "Starting Season Age:",
+  choices = seq(min(pitch_changes$age_from), max(pitch_changes$age_from), by = 2),
+  selected = c(min(pitch_changes$age_from), max(pitch_changes$age_from)),
+  grid = TRUE
+)
+```
+
+## Main
+
+```{r}
+#| context: server
+
+filtered_data <- reactive({
+  data <- pitch_changes |>
+    mutate(
+      switched_teams = team_from != team_to,
+      new_pitch_flag = pct_from < 0.01 & pct_to >= 0.03
+    ) |>
+    filter(
+      between(age_to, input$age_range[1], input$age_range[2]),
+      between(year_from, input$year_range[1], input$year_range[2])
+    )
+
+  if (input$switched_teams == "Yes") {
+    data <- data |> filter(switched_teams)
+  }
+
+  if (input$switched_teams == "No") {
+    data <- data |> filter(!switched_teams)
+  }
+
+  if (input$new_pitch == "Yes") {
+    data <- data |> filter(new_pitch_flag)
+  }
+
+  if (input$new_pitch == "No") {
+    data <- data |> filter(!new_pitch_flag)
+  }
+
+  data
+})
+
+cutoff <- reactive({
+  quantile(
+    filtered_data()$abs_change,
+    probs = input$cutoff_pct / 100,
+    na.rm = TRUE
+  )
+})
+
+filtered_cutoff_data <- reactive({
+  filtered_data() |>
+    mutate(
+      cutoff_TF = abs_change >= cutoff()
+    )
+})
+
+cutoff_pitcher_years <- reactive({
+  filtered_cutoff_data() |>
+    filter(cutoff_TF) |>
+    distinct(
+      pitcher,
+      player_name,
+      team_from,
+      team_to,
+      year_from,
+      year_to
+    )
+})
+
+cutoff_percent_changes <- reactive({
+  filtered_data() |>
+    semi_join(
+      cutoff_pitcher_years(),
+      by = c(
+        "pitcher",
+        "player_name",
+        "team_from",
+        "team_to",
+        "year_from",
+        "year_to"
+      )
+    ) |>
+    select(
+      pitcher,
+      player_name,
+      team_from,
+      team_to,
+      year_from,
+      year_to,
+      new_pitch,
+      pitch_type,
+      prop_change
+    ) |>
+    distinct() |>
+    pivot_wider(
+      names_from = pitch_type,
+      values_from = prop_change,
+      names_glue = "{pitch_type}_change",
+      values_fill = 0
+    ) |>
+    arrange(player_name, year_from, year_to)
+})
+
+
+
+```
+
+### Value Boxes (Row 1) {height=35% layout="[1,1,1,1]"}
+```{r}
+#| context: server
+
+output$total_rows <- renderText({
+  nrow(filtered_data())
+})
+
+output$pitcher_year_count <- renderText({
+  filtered_cutoff_data() |>
+    filter(cutoff_TF) |>
+    distinct(pitcher, year_from, year_to) |>
+    nrow()
+})
+
+output$unique_pitchers <- renderText({
+  filtered_cutoff_data() |>
+    filter(cutoff_TF) |>
+    distinct(pitcher) |>
+    nrow()
+})
+
+output$avg_fip <- renderText({
+  filtered_cutoff_data() |>
+    filter(cutoff_TF) |>
+    group_by(pitcher, year_from, year_to) |>
+    summarize(
+      FIP_diff = first(FIP_diff),
+      .groups = "drop"
+    ) |>
+    summarise(
+      avg_fip = mean(FIP_diff, na.rm = TRUE)
+    ) |>
+    pull(avg_fip) |>
+    round(2)
+})
+```
+
+#### Column 1
+
+::: {.valuebox icon="fire" color="#52B788"}
+Rows in Filtered Data:
+
+```{r}
+textOutput("total_rows")
+```
+:::
+
+#### Column 2
+
+::: {.valuebox icon="calendar-fill" color="#74C69D"}
+Pitcher-Year Transitions Within Cutoff:
+
+```{r}
+textOutput("pitcher_year_count")
+```
+:::
+
+#### Column 3
+
+::: {.valuebox icon="people-fill" color="#95D5B2"}
+Unique Pitchers Within Cutoff:
+
+```{r}
+textOutput("unique_pitchers")
+```
+:::
+
+#### Column 4
+
+::: {.valuebox icon="graph-up-arrow" color="#B7E4C7"}
+Average FIP Change Within Cutoff:
+
+```{r}
+textOutput("avg_fip")
+```
+:::
+
+### Graphs (Row 2) {height=65% layout="[1,1]" orientation="columns"}
+
+#### Column 1
+
+```{r}
+#| context: server
+cutoff_value <- reactive({
+  req(input$cutoff_pct)
+  quantile(
+    filtered_data()$abs_change,
+    probs = input$cutoff_pct / 100,
+    na.rm = TRUE
+  )
+})
+
+density_data <- reactive({
+  density(
+    filtered_data()$abs_change,
+    na.rm = TRUE
+  ) |>
+    with(tibble(x = x, y = y)) |>
+    mutate(
+      fill_color = if_else(
+        x >= cutoff_value(),
+        "#52B788",
+        "#B7E4C7"
+      )
+    )
+})
+
+output$density_chart <- renderPlot({
+  req(input$cutoff_pct)
+
+  density_data() |>
+    ggplot(aes(x = x, y = y)) +
+    geom_area(
+      aes(fill = fill_color),
+      alpha = 0.75
+    ) +
+    scale_fill_identity() +
+    geom_line(
+      color = "grey23",
+      linewidth = 1
+    ) +
+    geom_vline(
+      xintercept = cutoff_value(),
+      linetype = "dashed",
+      linewidth = 1,
+      color = "grey23"
+    ) +
+    annotate(
+      "label",
+  x = Inf,
+  y = Inf,
+  hjust = 1.05,
+  vjust = 1.5,
+  label = paste0(
+        input$cutoff_pct, "% Cutoff = ",
+        round(cutoff_value(), 3)
+      ),
+      size = 4
+    ) +
+    labs(
+      title = "Distribution of Year-to-Year Pitch Proportion Changes",
+      subtitle = glue::glue(
+        "<span style='color:#B7E4C7;'><b>typical pitch-mix changes</b></span>,
+         <span style='color:#52B788;'><b>top {100 - input$cutoff_pct}% largest changes</b></span>"
+      ),
+      x = "Absolute Change in Pitch Usage Proportion",
+      y = "Density"
+    ) +
+    theme_light() +
+    theme(
+      plot.subtitle = ggtext::element_markdown()
+    )
+})
+```
+
+```{r}
+imageOutput("density_chart")
+```
+
+#### Column 2
+
+```{r}
+#| context: server
+
+output$fip_diff_chart <- renderPlot({
+  filtered_cutoff_data() |>
+    ggplot(aes(x = FIP_diff, fill = cutoff_TF)) +
+    geom_histogram(
+      bins = 30,
+      color = "grey23",
+      linewidth = 0.2,
+      position = "stack"
+    ) +
+    scale_fill_manual(
+      values = c("TRUE" = "#52B788", "FALSE" = "#B7E4C7"),
+      labels = c("TRUE" = "Within cutoff", "FALSE" = "Outside cutoff"),
+      name = NULL
+    ) +
+    labs(
+      title = "Distribution of FIP Change",
+      subtitle = glue::glue("using cutoff of top {100 - input$cutoff_pct}% largest changes") ,
+      x = "FIP Difference",
+      y = "Count"
+    ) +
+    theme_light()
+})
+```
+
+```{r}
+imageOutput("fip_diff_chart")
+```
+
+# Individual Pitchers
+
+## Filters {.sidebar}
+
+```{r}
+selectInput("lookup_year", "Year:", choices = NULL)
+selectInput("lookup_team", "Team:", choices = NULL)
+selectInput("lookup_player", "Player:", choices = NULL)
+
+hr()
+
+sliderInput("highlight_year", "Career Year:", min = 2015, max = 2025, value = 2015, step = 1, sep = "")
+actionButton("play_btn", "▶ Play", class = "btn-theme-green")
+```
+
+```{r}
+#| context: server
+
+observe({
+  years <- player_year_data |> distinct(year) |> arrange(desc(year)) |> pull(year)
+  updateSelectInput(session, "lookup_year", choices = years)
+})
+
+observeEvent(input$lookup_year, {
+  req(input$lookup_year)
+  teams <- player_year_data |>
+    filter(year == input$lookup_year) |>
+    distinct(team) |>
+    arrange(team) |>
+    pull(team)
+
+  current_team <- isolate(input$lookup_team)
+  keep_team <- if (!is.null(current_team) && current_team %in% teams) current_team else ""
+
+  updateSelectInput(session, "lookup_team",
+    choices = c("All Teams" = "", teams),
+    selected = keep_team)
+})
+
+observeEvent(list(input$lookup_year, input$lookup_team), {
+  req(input$lookup_year)
+  data <- player_year_data |> filter(year == input$lookup_year)
+  if (!is.null(input$lookup_team) && input$lookup_team != "") {
+    data <- data |> filter(team == input$lookup_team)
+  }
+
+  # Build disambiguated labels: name + all teams they've ever played for
+  players <- data |> distinct(pitcher, player_name)
+
+  player_teams <- player_year_data |>
+    semi_join(players, by = "pitcher") |>
+    distinct(pitcher, team) |>
+    group_by(pitcher) |>
+    summarise(teams = paste(sort(unique(team)), collapse = "/"), .groups = "drop")
+
+  players <- players |>
+    left_join(player_teams, by = "pitcher") |>
+    mutate(label = paste0(player_name, " (", teams, ")")) |>
+    arrange(player_name)
+
+  current_player <- isolate(input$lookup_player)
+  keep_player <- if (!is.null(current_player) && current_player %in% players$pitcher) current_player else NULL
+
+  updateSelectInput(session, "lookup_player",
+    choices = setNames(players$pitcher, players$label),
+    selected = keep_player)
+})
+
+selected_player <- reactiveVal(NULL)
+
+observeEvent(input$lookup_player, {
+  req(input$lookup_player)
+  selected_player(list(pitcher = as.numeric(input$lookup_player), year = as.numeric(input$lookup_year)))
+})
+
+observeEvent(selected_player(), {
+  req(selected_player())
+  yrs <- player_year_data |>
+    filter(pitcher == selected_player()$pitcher) |>
+    distinct(year) |> pull(year) |> sort()
+
+  updateSliderInput(session, "highlight_year",
+    min = min(yrs), max = max(yrs), value = min(yrs))
+})
+
+playing <- reactiveVal(FALSE)
+
+observeEvent(input$play_btn, {
+  playing(!playing())
+  updateActionButton(session, "play_btn", label = if (playing()) "⏸ Pause" else "▶ Play")
+})
+
+observe({
+  req(playing())
+  invalidateLater(4000)
+  isolate({
+    yrs <- player_year_data |>
+      filter(pitcher == selected_player()$pitcher) |>
+      distinct(year) |> pull(year) |> sort()
+
+    current <- input$highlight_year
+    next_idx <- which(yrs == current) + 1
+
+    if (next_idx > length(yrs)) {
+      playing(FALSE)
+      updateActionButton(session, "play_btn", label = "▶ Play")
+      updateSliderInput(session, "highlight_year", value = yrs[1])
+    } else {
+      updateSliderInput(session, "highlight_year", value = yrs[next_idx])
+    }
+  })
+})
+```
+
+## Main
+
+### Row 1 {height=50%}
+
+#### Pitch Mix
+
+```{r}
+#| context: server
+
+output$pitch_mix_animated <- renderPlotly({
+  req(selected_player(), input$highlight_year)
+
+  pdata <- player_year_data |>
+    filter(pitcher == selected_player()$pitcher)
+
+  pitch_order <- pdata |>
+    group_by(pitch_type) |>
+    summarise(avg_pct = mean(pitch_pct, na.rm = TRUE)) |>
+    arrange(desc(avg_pct)) |>
+    pull(pitch_type)
+
+  bar_data <- pdata |>
+    filter(year == input$highlight_year, pitch_pct >= 0.01) |>
+    mutate(pitch_type = factor(pitch_type, levels = pitch_order))
+
+  plot_ly(bar_data, x = ~pitch_type, y = ~pitch_pct,
+          type = "bar", color = ~pitch_type,
+          colors = pitch_type_colors) |>
+    layout(
+      xaxis = list(categoryorder = "array", categoryarray = pitch_order),
+      yaxis = list(range = c(0, 1)),
+      title = paste("Pitch Mix —", input$highlight_year),
+      plot_bgcolor = "rgba(0,0,0,0)",
+      paper_bgcolor = "rgba(0,0,0,0)",
+      font = list(color = "#1B4332"),
+      transition = list(duration = 500, easing = "cubic-in-out")
+    ) |>
+    config(displayModeBar = FALSE)
+})
+```
+
+```{r}
+plotlyOutput("pitch_mix_animated")
+```
+
+#### Age {width=25%}
+
+```{r}
+#| context: server
+output$age_box <- renderText({
+  req(selected_player(), input$highlight_year)
+  player_year_data |>
+    filter(pitcher == selected_player()$pitcher, year == input$highlight_year) |>
+    distinct(Age) |>
+    pull(Age)
+})
+```
+
+::: {.valuebox icon="person-fill" color="#74C69D"}
+Age (Selected Year):
+
+```{r}
+textOutput("age_box")
+```
+:::
+
+### Row 2 {height=50%}
+
+#### FIP Trend
+
+```{r}
+#| context: server
+
+output$fip_animated <- renderPlotly({
+  req(selected_player(), input$highlight_year)
+
+  full_years <- player_year_data |>
+    filter(pitcher == selected_player()$pitcher) |>
+    distinct(year) |>
+    pull(year) |>
+    sort()
+
+  pdata <- player_year_data |>
+    filter(pitcher == selected_player()$pitcher, year <= input$highlight_year) |>
+    distinct(year, FIP) |>
+    arrange(year)
+
+  plot_ly(pdata, x = ~year, y = ~FIP,
+          type = "scatter", mode = "lines+markers",
+          line = list(color = "#2D6A4F"),
+          marker = list(color = "#52B788")) |>
+    layout(
+      title = "FIP Over Time",
+      xaxis = list(
+        range = c(min(full_years) - 0.5, max(full_years) + 0.5),
+        dtick = 1,
+        tickformat = "d"
+      ),
+      plot_bgcolor = "rgba(0,0,0,0)",
+      paper_bgcolor = "rgba(0,0,0,0)",
+      font = list(color = "#1B4332"),
+      transition = list(duration = 500, easing = "cubic-in-out")
+    ) |>
+    config(displayModeBar = FALSE)
+})
+```
+
+```{r}
+plotlyOutput("fip_animated")
+```
+
+#### FIP Change {width=25%}
+
+```{r}
+#| context: server
+
+output$fip_change_box <- renderText({
+  req(selected_player(), input$highlight_year)
+
+  fip_data <- player_year_data |>
+    filter(pitcher == selected_player()$pitcher) |>
+    distinct(year, FIP) |>
+    arrange(year)
+
+  current_fip <- fip_data |> filter(year == input$highlight_year) |> pull(FIP)
+  prior_fip <- fip_data |> filter(year == input$highlight_year - 1) |> pull(FIP)
+
+  if (length(current_fip) == 0 || length(prior_fip) == 0) {
+    return("N/A (no prior year data)")
+  }
+
+  change <- round(current_fip - prior_fip, 2)
+  paste0(if (change < 0) "▼ " else "▲ ", abs(change))
+})
+```
+
+::: {.valuebox icon="graph-up-arrow" color="#B7E4C7"}
+FIP Change vs. Prior Year:
+
+```{r}
+textOutput("fip_change_box")
+```
+:::
+
+# Leaderboard
+
+## Filters {.sidebar}
+```{r}
+#| context: server
+
+# Populate years once at startup
+observe({
+  years <- pitch_changes |> distinct(year_to) |> arrange(desc(year_to)) |> pull(year_to)
+  updateSelectInput(session, "lb_year", choices = years)
+})
+
+# Team choices depend on selected year
+observeEvent(input$lb_year, {
+  req(input$lb_year)
+  teams <- pitch_changes |>
+    filter(year_to == input$lb_year) |>
+    distinct(team_to) |>
+    arrange(team_to) |>
+    pull(team_to)
+
+  updateSelectInput(session, "lb_team",
+    choices = c("All Teams" = "", teams))
+})
+```
+
+```{r}
+selectInput("lb_year", "Season (ending year):", choices = NULL)
+
+selectInput(
+  "lb_rank_by",
+  "Rank by:",
+  choices = c(
+    "Biggest overall pitch-mix change" = "overall",
+    "Biggest FIP improvement" = "fip_improve",
+    "Biggest FIP decline" = "fip_decline",
+    "Fastball (FF) change" = "FF",
+    "Sinker (SI) change" = "SI",
+    "Cutter (FC) change" = "FC",
+    "Slider (SL) change" = "SL",
+    "Sweeper (ST) change" = "ST",
+    "Curveball (CU) change" = "CU",
+    "Knuckle curve (KC) change" = "KC",
+    "Changeup (CH) change" = "CH",
+    "Splitter (FS) change" = "FS"
+  )
+)
+
+selectInput("lb_team", "Team:", choices = c("All Teams" = ""))
+
+selectInput(
+  "lb_show_n",
+  "Show top:",
+  choices = c(10, 25, 50, 100),
+  selected = 25
+)
+```
+
+## Main
+
+### Summary (Row 1) {height=25% layout="[1,1]"}
+
+```{r}
+#| context: server
+
+# Shared filtered base, respecting Team selection
+lb_filtered <- reactive({
+  req(input$lb_year)
+  data <- pitch_changes |> filter(year_to == input$lb_year)
+  if (!is.null(input$lb_team) && input$lb_team != "") {
+    data <- data |> filter(team_to == input$lb_team)
+  }
+  data
+})
+
+output$lb_biggest_mix_change <- renderText({
+  top_row <- max_pitch_change |>
+    semi_join(lb_filtered(), by = c("pitcher", "year_from", "year_to")) |>
+    slice_max(biggest_abs_change, n = 1, with_ties = FALSE)
+
+  if (nrow(top_row) == 0) return("N/A")
+  paste0(top_row$player_name, " — ", top_row$biggest_changed_pitch,
+         " (", round(top_row$biggest_abs_change * 100, 1), "%)")
+})
+
+output$lb_biggest_fip_improvement <- renderText({
+  top_row <- lb_filtered() |>
+    distinct(pitcher, player_name, year_from, year_to, FIP_diff) |>
+    filter(!is.na(FIP_diff)) |>
+    slice_min(FIP_diff, n = 1, with_ties = FALSE)
+
+  if (nrow(top_row) == 0) return("N/A")
+  paste0(top_row$player_name, " (", round(top_row$FIP_diff, 2), ")")
+})
+```
+
+#### Column 1
+
+::: {.valuebox icon="lightning" color="#52B788"}
+Biggest Mix Change:
+
+```{r}
+textOutput("lb_biggest_mix_change")
+```
+:::
+
+#### Column 2
+
+::: {.valuebox icon="graph-up-arrow" color="#74C69D"}
+Biggest FIP Improvement:
+
+```{r}
+textOutput("lb_biggest_fip_improvement")
+```
+:::
+
+### Row 2
+
+```{r}
+#| context: server
+
+leaderboard_data <- reactive({
+  req(input$lb_year, input$lb_rank_by)
+  base <- lb_filtered()
+
+  if (input$lb_rank_by == "overall") {
+    max_pitch_change |>
+      semi_join(base, by = c("pitcher", "year_from", "year_to")) |>
+      transmute(
+        player_name, team_to, biggest_changed_pitch,
+        change = biggest_abs_change,
+        FIP_diff
+      ) |>
+      arrange(desc(change))
+
+  } else if (input$lb_rank_by == "fip_improve") {
+    base |>
+      distinct(player_name, team_to, year_from, year_to, FIP_diff) |>
+      filter(!is.na(FIP_diff)) |>
+      transmute(player_name, team_to, biggest_changed_pitch = NA_character_, change = FIP_diff, FIP_diff) |>
+      arrange(FIP_diff)
+
+  } else if (input$lb_rank_by == "fip_decline") {
+    base |>
+      distinct(player_name, team_to, year_from, year_to, FIP_diff) |>
+      filter(!is.na(FIP_diff)) |>
+      transmute(player_name, team_to, biggest_changed_pitch = NA_character_, change = FIP_diff, FIP_diff) |>
+      arrange(desc(FIP_diff))
+
+  } else {
+    base |>
+      filter(pitch_type == input$lb_rank_by) |>
+      transmute(player_name, team_to, biggest_changed_pitch = pitch_type, change = abs_change, FIP_diff) |>
+      arrange(desc(change))
+  }
+}) |>
+  bindEvent(input$lb_year, input$lb_team, input$lb_rank_by)
+
+output$leaderboard_table <- render_gt({
+  req(leaderboard_data())
+
+  n_show <- as.numeric(input$lb_show_n)
+  tbl <- leaderboard_data() |> slice_head(n = n_show)
+
+  is_fip_mode <- input$lb_rank_by %in% c("fip_improve", "fip_decline")
+
+  tbl_gt <- tbl |>
+    mutate(rank = row_number(), .before = 1) |>
+    gt() |>
+    tab_header(
+      title = md("**Pitch Mix Leaderboard**"),
+      subtitle = paste0("Season ending ", input$lb_year,
+                         if (input$lb_team != "") paste0(" · ", input$lb_team) else "")
+    ) |>
+    cols_label(
+      rank = "#",
+      player_name = "Player",
+      team_to = "Team",
+      biggest_changed_pitch = "Pitch",
+      change = if (is_fip_mode) "FIP Change" else "Change",
+      FIP_diff = "FIP Change"
+    )
+
+  # Branch formatting/hiding based on mode, instead of conditional `rows =`
+  if (is_fip_mode) {
+    tbl_gt <- tbl_gt |>
+      fmt_number(columns = FIP_diff, decimals = 2) |>
+      cols_hide(columns = "biggest_changed_pitch") |>
+      data_color(
+        columns = FIP_diff,
+        colors = col_numeric(
+          palette = c("#1B4332", "white", "#B7E4C7"),
+          domain = NULL
+        )
+      )
+  } else {
+    tbl_gt <- tbl_gt |>
+      fmt_percent(columns = change, decimals = 1) |>
+      fmt_number(columns = FIP_diff, decimals = 2) |>
+      data_color(
+        columns = change,
+        colors = col_numeric(
+          palette = c("#B7E4C7", "white", "#1B4332"),
+          domain = NULL
+        )
+      ) |>
+      data_color(
+        columns = FIP_diff,
+        colors = col_numeric(
+          palette = c("#1B4332", "white", "#B7E4C7"),
+          domain = NULL
+        )
+      )
+  }
+
+  tbl_gt |>
+    tab_options(
+      heading.background.color = "#2D6A4F",
+      column_labels.background.color = "#B7E4C7",
+      row.striping.background_color = "#EAF3E9",
+      row.striping.include_table_body = TRUE,
+      data_row.padding = px(10),
+      heading.padding = px(10)
+    ) |>
+    tab_style(
+      style = cell_text(color = "white", weight = "bold"),
+      locations = cells_title(groups = "title")
+    ) |>
+    tab_style(
+      style = cell_text(color = "white"),
+      locations = cells_title(groups = "subtitle")
+    ) |>
+    tab_style(
+      style = cell_text(weight = "bold", color = "#1B4332"),
+      locations = cells_column_labels(everything())
+    ) |>
+    tab_style(
+      style = cell_borders(sides = "bottom", color = "#40916C", weight = px(2)),
+      locations = list(cells_column_labels(), cells_title(groups = "subtitle"))
+    ) |>
+    opt_row_striping()
+})
+```
+
+```{r}
+gt_output("leaderboard_table")
+```
